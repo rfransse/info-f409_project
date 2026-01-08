@@ -2,34 +2,33 @@ import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 
-# ============================================================
-#  Rock–Paper–Scissors payoff (player 1 reward)
-# ============================================================
+
+#  payoff (player 1 reward)
+
 # Actions: 0=Rock, 1=Paper, 2=Scissors
 # Payoff: win=+1, loss=-1, tie=0
 RPS_PAYOFF = np.array([
-    [ 0, -1,  1],  # Rock vs (R,P,S)
+    [ 0, -1,  1],  # Rock
     [ 1,  0, -1],  # Paper
     [-1,  1,  0],  # Scissors
 ], dtype=float)
 
 def sample_action(mix, rng):
-    """Sample base action from a mixed strategy."""
     return rng.choice(3, p=mix)
 
+
 def project_simplex(p, eps=1e-12):
-    """Project a vector onto the probability simplex."""
+    """Initial simple projection to simplex with small eps to avoid zeros."""
     p = np.maximum(p, eps)
     p = p / p.sum()
     return p
 
-# ============================================================
-#  Discretized simplex grid (N=25 => 325 points) as in paper
-# ============================================================
+
+#  simplex grid (N=25 => 325 points) as in the paper
+
 def simplex_grid_3(N=25):
     """
     Uniform grid for (pR, pP, pS) with step 1/(N-1).
-    Points satisfy i+j<=N-1.
     Total size = N(N+1)/2 = 325 for N=25.
     """
     step = 1.0 / (N - 1)
@@ -42,9 +41,10 @@ def simplex_grid_3(N=25):
             pts.append(np.array([pR, pP, pS], dtype=float))
     return np.array(pts)  # (325,3)
 
-# ============================================================
-#  Opponent estimators: Omniscient, EMA (Eq.3), Bayes (Eqs.4-5)
-# ============================================================
+
+#  -- Opponent estimators --
+
+# EMA Equation 3
 @dataclass
 class EMAEstimator:
     mu: float = 0.005
@@ -62,23 +62,14 @@ class EMAEstimator:
     def estimate(self):
         return self.ybar
 
-
+# Bayes Equations 4-5
 @dataclass
-class FastBayesEstimator:
+class BayesEstimator:
     """
-    Practical recency-weighted Naive Bayes over grid points in log-space.
-
-    Paper (Eqs.4-5) uses: P(H|y) = Π y_{a(k)}^{w_k}.
-    A computationally efficient version uses exponential recency weights:
-      w_k = beta^{(t-k)}  (beta close to 1), equivalent to a decaying memory.
-    This preserves the "recent actions matter more" intention and is stable.
-
-    Implementation:
-      loglik[y] <- beta*loglik[y] + log(y[action])
-      posterior proportional to exp(loglik) (uniform prior by default)
+    BayesEstimator using equations 4-5 from the paper.
     """
     grid: np.ndarray
-    beta: float = 0.995
+    beta: float = 0.995 # 1 - MU
     prior: np.ndarray = None
     loglik: np.ndarray = None
 
@@ -89,13 +80,13 @@ class FastBayesEstimator:
             self.prior = np.ones(M, dtype=float) / M
 
     def update(self, opp_action, eps=1e-12):
-        # Decay old evidence (recency)
+        # Decay
         self.loglik *= self.beta
-        # Add new evidence
+        # Add new
         self.loglik += np.log(np.clip(self.grid[:, opp_action], eps, 1.0))
 
     def posterior(self):
-        # posterior ∝ prior * exp(loglik - maxlog) for numerical stability
+        # posterior P(y|H) ∝ prior(y) * exp(loglik(y))
         maxlog = np.max(self.loglik)
         unnorm = self.prior * np.exp(self.loglik - maxlog)
         Z = unnorm.sum()
@@ -107,42 +98,29 @@ class FastBayesEstimator:
         p = self.posterior()
         return (p[:, None] * self.grid).sum(axis=0)
 
-# ============================================================
-#  Opponents: IGA and PHC (paper's test opponents)
-# ============================================================
+
+# IGA opponent (Equation 8)
 @dataclass
 class IGAOpponent:
     """
-    Infinitesimal Gradient Ascent style update for player 2.
-    Player 2 tries to maximize its own expected payoff u2 = -u1 in zero-sum RPS.
-
-    u1(x,y) = x^T * A * y
-    grad_y u1 = A^T x
-    grad_y u2 = -A^T x
-
-    Update:
-      y <- proj_simplex( y + eta * grad_y u2 )
+    Infinitesimal Gradient Ascent for player 2
     """
-    eta: float = 0.002
+    eta: float = 0.05
     y: np.ndarray = None
 
     def reset(self, rng):
         self.y = project_simplex(rng.random(3))
 
     def step(self, x):
-        grad_u2 = - (RPS_PAYOFF.T @ x)
+        grad_u2 = -(RPS_PAYOFF.T @ x)
         self.y = project_simplex(self.y + self.eta * grad_u2)
         return self.y
 
-
+# PHC opponent 
 @dataclass
 class PHCOpponent:
     """
-    Simple Policy Hill-Climbing (PHC)-like opponent:
-      - maintains Q over base actions
-      - updates policy a small step toward greedy(Q)
-
-    This is a minimal PHC consistent with the paper description.
+    Policy Hill-Climbing opponent. (not a lot of info in the paper)
     """
     alpha_q: float = 0.05
     delta: float = 0.002
@@ -160,10 +138,10 @@ class PHCOpponent:
         return rng.choice(3, p=self.pi)
 
     def update(self, action, reward):
-        # reward is for player 2; in zero-sum reward2 = -reward1
+        # zero-sum : reward2 = -reward1
         self.q[action] = (1 - self.alpha_q) * self.q[action] + self.alpha_q * reward
 
-        # hill-climb policy toward greedy action
+        # hill-climb policy
         best = int(np.argmax(self.q))
         for a in range(3):
             if a == best:
@@ -175,9 +153,8 @@ class PHCOpponent:
     def strategy(self):
         return self.pi
 
-# ============================================================
-#  Hyper-Q learner (Eqs.1-2) with grid for y and x
-# ============================================================
+
+#  Hyper-Q learner (Equations 1-2)
 class HyperQ:
     def __init__(self, grid, alpha=0.01, gamma=0.9, rng=None):
         self.grid = grid
@@ -191,12 +168,16 @@ class HyperQ:
 
     
     def greedy_x_idx(self, y_idx):
-        return int(np.argmax(self.Q[y_idx]))
+        row = self.Q[y_idx]
+        maxv = np.max(row)
+        candidates = np.flatnonzero(np.isclose(row, maxv))
+        return self.rng.choice(candidates)
+
 
     def greedy_x(self, y_idx):
         return self.grid[self.greedy_x_idx(y_idx)]
 
-    def td_update_single(self, y_idx, x_idx, r, y_next_idx):
+    def td_update(self, y_idx, x_idx, r, y_next_idx):
         td_target = r + self.gamma * np.max(self.Q[y_next_idx])
         td_err = td_target - self.Q[y_idx, x_idx]
         self.Q[y_idx, x_idx] += self.alpha * td_err
@@ -204,9 +185,8 @@ class HyperQ:
 
     def bayes_update(self, post_y, x_idx, r, post_y_next):
         """
-        Implements the Bayesian modification (Eqs.6-7) in the "table update" spirit:
+        Bayesian Equation 6-7
           ΔQ(y,x) += α * P(y|H) * (r + γ max_x' E_{y'}[Q(y',x')] - Q(y,x))
-        Using the approximation that next posterior is available (paper mentions this).
         """
         # expected next value under next posterior
         V_next = 0.0
@@ -222,33 +202,32 @@ class HyperQ:
             td_err_acc += py * abs(td_err)
         return td_err_acc
 
-# ============================================================
-#  Utility: map a continuous estimate to nearest grid index
-# ============================================================
+
+# estimate nearest grid index
 def nearest_grid_idx(grid, v):
     d = np.sum((grid - v[None, :])**2, axis=1)
     return int(np.argmin(d))
 
+# smoothing function
 def moving_average(x, win):
     if win <= 1:
         return x
     c = np.cumsum(np.insert(x, 0, 0.0))
     y = (c[win:] - c[:-win]) / win
-    # pad to original length
+
     pad = np.full(win - 1, y[0])
     return np.concatenate([pad, y])
 
-# ============================================================
-#  Experiments replicating Figures 1–4 structure
-# ============================================================
+
+#  Experiments
 def run_hyperq_vs_iga(
-    steps=400_000,
+    steps=600_000,
     N=25,
     alpha=0.01,
     gamma=0.9,
     mu=0.005,
     bayes_beta=0.995,
-    iga_eta=0.002,
+    iga_eta=0.05,
     restart_period=1000,
     smooth=5000,
     seed=0
@@ -262,7 +241,7 @@ def run_hyperq_vs_iga(
     hq_bay = HyperQ(grid, alpha=alpha, gamma=gamma, rng=rng)
 
     ema = EMAEstimator(mu=mu); ema.reset()
-    bay = FastBayesEstimator(grid=grid, beta=bayes_beta); bay.reset()
+    bay = BayesEstimator(grid=grid, beta=bayes_beta); bay.reset()
 
     iga = IGAOpponent(eta=iga_eta); iga.reset(rng)
 
@@ -275,45 +254,14 @@ def run_hyperq_vs_iga(
     rew_ema = np.zeros(steps)
     rew_bay = np.zeros(steps)
 
-    for t in range(steps):
-        # random restarts (paper: every 1000 steps)
-        if t % restart_period == 0:
-            iga.reset(rng)
-            ema.reset()
-            bay.reset()
-
-        # Opponent updates its mixed strategy using current x (omniscient access assumption in paper)
-        # We'll compute each Hyper-Q agent's x before updating IGA so each run is self-consistent.
-        # --- Omniscient run ---
-        y_true = iga.y.copy()
-        y_idx = nearest_grid_idx(grid, y_true)
-        x_idx = hq_omn.greedy_x_idx(y_idx)
-        x = grid[x_idx]
-        # IGA step sees x (omniscient)
-        y_true_next = iga.step(x)
-        y_next_idx = nearest_grid_idx(grid, y_true_next)
-
-        a1 = sample_action(x, rng)
-        a2 = sample_action(y_true_next, rng)
-        r1 = RPS_PAYOFF[a1, a2]
-        td_omn[t] = abs(hq_omn.td_update_single(y_idx, x_idx, r1, y_next_idx))
-        rew_omn[t] = r1
-
-        # --- EMA run ---
-        # Use same underlying IGA dynamics but re-initialize IGA for fairness? In the paper, each method is a separate run.
-        # Here, to keep it simple and comparable, we run *separate* IGA instances per method:
-        # (So create local IGA copies)
-        # For correctness with separate dynamics, handle separately below.
-        break
-
-    # The above break is intentional: we implement each method as separate full simulation below.
+    
     def one_run(estimator_kind):
         rng2 = np.random.default_rng(seed + (0 if estimator_kind=="omn" else 1 if estimator_kind=="ema" else 2))
         grid2 = grid
         hq = HyperQ(grid2, alpha=alpha, gamma=gamma, rng=rng2)
         iga2 = IGAOpponent(eta=iga_eta); iga2.reset(rng2)
         ema2 = EMAEstimator(mu=mu); ema2.reset()
-        bay2 = FastBayesEstimator(grid=grid2, beta=bayes_beta); bay2.reset()
+        bay2 = BayesEstimator(grid=grid2, beta=bayes_beta); bay2.reset()
 
         td = np.zeros(steps)
         rw = np.zeros(steps)
@@ -338,7 +286,7 @@ def run_hyperq_vs_iga(
                 a1 = sample_action(x, rng2)
                 r1 = RPS_PAYOFF[a1, a2]
                 y_next_idx = nearest_grid_idx(grid2, y_true_next)
-                td[t] = abs(hq.td_update_single(y_idx, x_idx, r1, y_next_idx))
+                td[t] = abs(hq.td_update(y_idx, x_idx, r1, y_next_idx))
                 rw[t] = r1
 
             elif estimator_kind == "ema":
@@ -354,7 +302,7 @@ def run_hyperq_vs_iga(
                 ema2.update(a2)
                 y_est_next = ema2.estimate()
                 y_next_idx = nearest_grid_idx(grid2, y_est_next)
-                td[t] = abs(hq.td_update_single(y_idx, x_idx, r1, y_next_idx))
+                td[t] = abs(hq.td_update(y_idx, x_idx, r1, y_next_idx))
                 rw[t] = r1
 
             else:  # "bay"
@@ -399,21 +347,16 @@ def run_iga_trajectory(
     N=25,
     alpha=0.01,
     gamma=0.9,
-    iga_eta=0.002,
-    smooth_reward=200,
+    iga_eta=0.05,
+    smooth=0,
     seed=123
 ):
-    """
-    Produces the Figure-2 style plot:
-      - IGA probabilities for Rock and Paper over time
-      - Hyper-Q cumulative reward (rescaled) as dots
-    """
     rng = np.random.default_rng(seed)
     grid = simplex_grid_3(N)
     hq = HyperQ(grid, alpha=alpha, gamma=gamma, rng=rng)
     iga = IGAOpponent(eta=iga_eta); iga.reset(rng)
 
-    # exploring start: pick a random y grid point as initial estimate
+    # exploring start with a random y grid point
     y0 = project_simplex(rng.random(3))
     y_idx = nearest_grid_idx(grid, y0)
 
@@ -423,11 +366,12 @@ def run_iga_trajectory(
 
     total = 0.0
     for t in range(steps):
+
         # Hyper-Q greedy policy
         x_idx = hq.greedy_x_idx(y_idx)
         x = grid[x_idx]
 
-        # IGA adapts using x
+        # IGA step
         y_true_next = iga.step(x)
 
         # sample play
@@ -435,9 +379,9 @@ def run_iga_trajectory(
         a1 = sample_action(x, rng)
         r1 = RPS_PAYOFF[a1, a2]
 
-        # Hyper-Q update with omniscient y (for this trajectory demo)
+        # Hyper-Q update with omniscient y 
         y_next_idx = nearest_grid_idx(grid, y_true_next)
-        hq.td_update_single(y_idx, x_idx, r1, y_next_idx)
+        hq.td_update(y_idx, x_idx, r1, y_next_idx)
 
         y_idx = y_next_idx
 
@@ -447,16 +391,16 @@ def run_iga_trajectory(
         total += r1
         cum_rew[t] = total
 
-    # rescale cumulative reward to roughly 0..1 for plotting as in paper figure
-    cr = cum_rew - cum_rew.min()
+    # rescale cumulative reward for plotting
+    cr = abs(cum_rew)
     if cr.max() > 1e-12:
         cr = cr / cr.max()
-    # smooth cumulative reward slightly (dots still look like dots if you plot sparsely)
-    cr_s = moving_average(cr, smooth_reward)
-    return rock_prob, paper_prob, cr_s
+    
+    
+    return moving_average(rock_prob, smooth), moving_average(paper_prob, smooth), cr
 
 def run_hyperq_vs_phc(
-    steps=1_200_000,
+    steps=400_000,
     N=25,
     alpha=0.01,
     gamma=0.9,
@@ -474,7 +418,7 @@ def run_hyperq_vs_phc(
         hq = HyperQ(grid, alpha=alpha, gamma=gamma, rng=rng2)
         phc = PHCOpponent(alpha_q=0.05, delta=0.002, epsilon=0.0); phc.reset(rng2)
         ema2 = EMAEstimator(mu=mu); ema2.reset()
-        bay2 = FastBayesEstimator(grid=grid, beta=bayes_beta); bay2.reset()
+        bay2 = BayesEstimator(grid=grid, beta=bayes_beta); bay2.reset()
 
         td = np.zeros(steps)
         rw = np.zeros(steps)
@@ -500,7 +444,7 @@ def run_hyperq_vs_phc(
                 phc.update(a2, r2)
 
                 y_next_idx = nearest_grid_idx(grid, phc.strategy())
-                td[t] = abs(hq.td_update_single(y_idx, x_idx, r1, y_next_idx))
+                td[t] = abs(hq.td_update(y_idx, x_idx, r1, y_next_idx))
                 rw[t] = r1
 
             elif kind == "ema":
@@ -517,7 +461,7 @@ def run_hyperq_vs_phc(
 
                 ema2.update(a2)
                 y_next_idx = nearest_grid_idx(grid, ema2.estimate())
-                td[t] = abs(hq.td_update_single(y_idx, x_idx, r1, y_next_idx))
+                td[t] = abs(hq.td_update(y_idx, x_idx, r1, y_next_idx))
                 rw[t] = r1
 
             else:  # bayes
@@ -559,43 +503,45 @@ def run_hyperq_selfplay_bellman(
     mode="omn"  # "omn" or "bay"
 ):
     rng = np.random.default_rng(seed)
-    grid = simplex_grid_3(N)
+    grid1 = simplex_grid_3(N)
+    grid2 = simplex_grid_3(N)
 
-    hq1 = HyperQ(grid, alpha=alpha, gamma=gamma, rng=rng)
-    hq2 = HyperQ(grid, alpha=alpha, gamma=gamma, rng=rng)
+    hq1 = HyperQ(grid1, alpha=alpha, gamma=gamma, rng=rng)
+    hq2 = HyperQ(grid2, alpha=alpha, gamma=gamma, rng=rng)
 
     if mode == "bay":
-        b1 = FastBayesEstimator(grid=grid, beta=bayes_beta); b1.reset()
-        b2 = FastBayesEstimator(grid=grid, beta=bayes_beta); b2.reset()
+        b1 = BayesEstimator(grid=grid1, beta=bayes_beta); b1.reset()
+        b2 = BayesEstimator(grid=grid2, beta=bayes_beta); b2.reset()
 
     td = np.zeros(steps)
 
-    # initialize estimates
-    y1_est = np.array([1/3, 1/3, 1/3], dtype=float)
-    y2_est = np.array([1/3, 1/3, 1/3], dtype=float)
-    y1_idx = nearest_grid_idx(grid, y1_est)
-    y2_idx = nearest_grid_idx(grid, y2_est)
+    # initialize
+    y1 = project_simplex(rng.random(3))
+    y2 = project_simplex(rng.random(3))
+    y1_idx = nearest_grid_idx(grid1, y1)
+    y2_idx = nearest_grid_idx(grid2, y2)
 
     for t in range(steps):
         if mode == "omn":
             x1_idx = hq1.greedy_x_idx(y1_idx)
             x2_idx = hq2.greedy_x_idx(y2_idx)
-            x1 = grid[x1_idx]
-            x2 = grid[x2_idx]
+
+            x1 = grid1[x1_idx]
+            x2 = grid2[x2_idx]
 
             a1 = sample_action(x1, rng)
             a2 = sample_action(x2, rng)
 
             r1 = RPS_PAYOFF[a1, a2]
             r2 = -r1
+            
+            # check opponent's next mixed strategy
+            y1_next_idx = nearest_grid_idx(grid2, x2)
+            y2_next_idx = nearest_grid_idx(grid1, x1)
 
-            # omniscient: each "observes" opponent mixed exactly (here: opponent's actual x)
-            y1_next_idx = nearest_grid_idx(grid, x2)
-            y2_next_idx = nearest_grid_idx(grid, x1)
-
-            e1 = abs(hq1.td_update_single(y1_idx, x1_idx, r1, y1_next_idx))
-            e2 = abs(hq2.td_update_single(y2_idx, x2_idx, r2, y2_next_idx))
-            td[t] = 0.5 * (e1 + e2)
+            e1 = abs(hq1.td_update(y1_idx, x1_idx, r1, y1_next_idx))
+            e2 = abs(hq2.td_update(y2_idx, x2_idx, r2, y2_next_idx))
+            td[t] = e1
 
             y1_idx, y2_idx = y1_next_idx, y2_next_idx
 
@@ -603,10 +549,17 @@ def run_hyperq_selfplay_bellman(
             post1 = b1.posterior()
             post2 = b2.posterior()
 
-            x1_idx = int(np.argmax(post1 @ hq1.Q))
-            x2_idx = int(np.argmax(post2 @ hq2.Q))
-            x1 = grid[x1_idx]
-            x2 = grid[x2_idx]
+            q1_exp = post1 @ hq1.Q 
+            maxv1 = np.max(q1_exp)
+            candidates1 = np.flatnonzero(np.isclose(q1_exp, maxv1))
+            x1_idx =  rng.choice(candidates1)
+            q2_exp = post2 @ hq2.Q
+            maxv2 = np.max(q2_exp)
+            candidates2 = np.flatnonzero(np.isclose(q2_exp, maxv2))
+            x2_idx =  rng.choice(candidates2)
+
+            x1 = grid1[x1_idx]
+            x2 = grid2[x2_idx]
 
             a1 = sample_action(x1, rng)
             a2 = sample_action(x2, rng)
@@ -614,7 +567,7 @@ def run_hyperq_selfplay_bellman(
             r1 = RPS_PAYOFF[a1, a2]
             r2 = -r1
 
-            # each updates Bayes belief about the other's policy from observed action
+            # updates Bayes belief with other's policy
             b1.update(a2)
             b2.update(a1)
             post1_next = b1.posterior()
@@ -622,14 +575,14 @@ def run_hyperq_selfplay_bellman(
 
             e1 = hq1.bayes_update(post1, x1_idx, r1, post1_next)
             e2 = hq2.bayes_update(post2, x2_idx, r2, post2_next)
-            td[t] = 0.5 * (e1 + e2)
+            td[t] = e1
 
     return moving_average(td, smooth)
 
-# ============================================================
-#  Plotting functions (Figure 1–4 layout)
-# ============================================================
-def plot_figure1_like(results, title_prefix="Hyper-Q vs. IGA"):
+
+#  Plotting functions Figure 1–4 
+
+def plot_figure1(results, title_prefix="Hyper-Q vs. IGA", filename="figure1.png"):
     td = results["td"]
     rw = results["rew"]
     T = len(next(iter(td.values())))
@@ -652,10 +605,10 @@ def plot_figure1_like(results, title_prefix="Hyper-Q vs. IGA"):
     axes[1].legend()
 
     plt.tight_layout()
-    plt.savefig("zaza.png")
+    plt.savefig(filename)
     #plt.show()
 
-def plot_figure2_like(rock_prob, paper_prob, cum_rew_scaled):
+def plot_figure2(rock_prob, paper_prob, cum_rew_scaled):
     T = len(rock_prob)
     x = np.arange(T)
 
@@ -663,19 +616,19 @@ def plot_figure2_like(rock_prob, paper_prob, cum_rew_scaled):
     plt.plot(x, rock_prob, label="IGA_Rock_Prob")
     plt.plot(x, paper_prob, label="IGA_Paper_Prob")
 
-    # Plot cumulative reward as dots (subsample for visibility)
+    
     idx = np.arange(0, T, max(1, T // 400))
     plt.scatter(idx, cum_rew_scaled[idx], s=10, label="HyperQ_Reward (rescaled)")
 
-    plt.title("Asymptotic IGA Trajectory (Figure-2 style)")
+    plt.title("Figure 2 Asymptotic IGA Trajectory ")
     plt.xlabel("Time Steps")
     plt.ylabel("Probability / Rescaled reward")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("zaza2.png")
+    plt.savefig("figure2.png")
     #plt.show()
 
-def plot_figure4_like(td_omn, td_bay):
+def plot_figure4(td_omn, td_bay):
     x1 = np.arange(len(td_omn))
     x2 = np.arange(len(td_bay))
 
@@ -691,21 +644,45 @@ def plot_figure4_like(td_omn, td_bay):
     axes[1].set_ylabel("Bellman/TD error")
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig("figure4.png")
 
-# ============================================================
-#  Main: run smaller defaults quickly; scale up to match paper
-# ============================================================
+
+#  Main
+
 if __name__ == "__main__":
-    # -------- Figure 1 style (Hyper-Q vs IGA) --------
-    #res_iga = run_hyperq_vs_iga(
-    #    steps=400_000,       # paper uses 1.6e6; increase if you can
-    #    smooth=4000,
-    #    seed=0
-    #)
-    #plot_figure1_like(res_iga, title_prefix="Hyper-Q vs. IGA")
+    
+    # Figure 1 (Hyper-Q vs IGA) 
+    res_iga = run_hyperq_vs_iga(
+        steps=800_000,
+        smooth=5000,
+        seed=0
+    )
+    plot_figure1(res_iga, title_prefix="Hyper-Q vs. IGA", filename="figure1.png")
     
 
-    # -------- Figure 2 style trajectory --------
-    #rock, paper, cr = run_iga_trajectory(steps=40_000, seed=123)
-    #plot_figure2_like(rock, paper, cr)
+    # Figure 2 trajectory 
+    rock, paper, cr = run_iga_trajectory(steps=40_000, seed=777, smooth=100)
+    plot_figure2(rock, paper, cr)
+    
+    # Figure 3 (Hyper-Q vs PHC) 
+    res_phc = run_hyperq_vs_phc(
+        steps=400_000,
+        smooth=5000,
+        seed=42
+    )
+    plot_figure1(res_phc, title_prefix="Hyper-Q vs. PHC", filename="figure3.png")
+    
+    # Figure 4 (Hyper-Q self-play) 
+    td_omn = run_hyperq_selfplay_bellman(
+        steps=400_000,    
+        smooth=5000,
+        seed=123,
+        mode="omn"
+    )
+    td_bay = run_hyperq_selfplay_bellman(
+        steps=400_000,    
+        smooth=5000,
+        seed=123,
+        mode="bay"
+    )
+    plot_figure4(td_omn, td_bay)
